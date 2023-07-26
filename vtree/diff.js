@@ -11,13 +11,75 @@ var diffProps = require("./diff-props")
 
 module.exports = diff
 
-function diff(a, b) {
-    var patch = { a: a }
-    walk(a, b, patch, 0)
-    return patch
+var patchTypeNames = {
+    0: 'NONE',
+    1: 'VTEXT',
+    2: 'VNODE',
+    3: 'WIDGET',
+    4: 'PROPS',
+    5: 'ORDER',
+    6: 'INSERT',
+    7: 'REMOVE',
+    8: 'THUNK'
 }
 
-function walk(a, b, patch, index) {
+
+function diff(a, b) {
+    var patch = {a: a}
+    var logEntries = [];
+    walk(a, b, patch, 0, logEntries)
+    var postProcessedLog = postProcessLog(logEntries);
+    // console.log(`Unified Diff Result:\n${postProcessedLog.diffText}`);
+    return postProcessedLog
+}
+
+function postProcessLog(logEntries) {
+    // Extract all the INS and DEL entries
+    let insertions = logEntries.map(log => log.match(/\[INS\].+?\[\/INS\]/g) || [])
+        .flat()
+        .map(entry => entry.replace(/\[INS\]/g, '').replace(/\[\/INS\]/g, ''));
+
+    let deletions = logEntries.map(log => log.match(/\[DEL\].+?\[\/DEL\]/g) || [])
+        .flat()
+        .map(entry => entry.replace(/\[DEL\]/g, '').replace(/\[\/DEL\]/g, ''));
+
+    // Filter out the insertions that also have a deletion
+    let uniqueInsertions = insertions.filter((insertion, index) => {
+        // Check if this insertion is followed by a deletion of the same element
+        let nextLog = logEntries[index + 1];
+        if (nextLog && nextLog.includes(`[DEL]${insertion}[/DEL]`)) {
+            // This is a reordering, not a unique insertion
+            return false;
+        }
+        // This is a unique insertion
+        return !deletions.includes(insertion);
+    });
+
+    // Join the unique insertions into a single string
+    let unifiedDiffResult = uniqueInsertions.map(insertion => `[INS]${insertion}[/INS]`).join('\n');
+
+    // Add the deletions that are not followed by an insertion of the same element
+    let uniqueDeletions = deletions.filter((deletion, index) => {
+        let nextLog = logEntries[index + 1];
+        if (nextLog && nextLog.includes(`[INS]${deletion}[/INS]`)) {
+            // This is a reordering, not a unique deletion
+            return false;
+        }
+        // This is a unique deletion
+        return true;
+    });
+
+    // Join the unique deletions into the unified diff result
+    unifiedDiffResult += uniqueDeletions.map(deletion => `[DEL]${deletion}[/DEL]`).join('\n');
+
+    return {
+        diffText: unifiedDiffResult,
+        numInsertions: uniqueInsertions.length,
+        numDeletions: uniqueDeletions.length
+    };
+}
+
+function walk(a, b, patch, index, logEntries) {
     if (a === b) {
         return
     }
@@ -28,16 +90,13 @@ function walk(a, b, patch, index) {
     if (isThunk(a) || isThunk(b)) {
         thunks(a, b, patch, index)
     } else if (b == null) {
-
-        // If a is a widget we will add a remove patch for it
-        // Otherwise any child widgets/hooks must be destroyed.
-        // This prevents adding two remove patches for a widget.
         if (!isWidget(a)) {
             clearState(a, patch, index)
             apply = patch[index]
         }
-
-        apply = appendPatch(apply, new VPatch(VPatch.REMOVE, a, b))
+        var newPatch = new VPatch(VPatch.REMOVE, a, b);
+        logEntries.push(`[REMOVE]${extractNodeContent(a)}[/REMOVE]`);
+        apply = appendPatch(apply, newPatch);
     } else if (isVNode(b)) {
         if (isVNode(a)) {
             if (a.tagName === b.tagName &&
@@ -45,31 +104,46 @@ function walk(a, b, patch, index) {
                 a.key === b.key) {
                 var propsPatch = diffProps(a.properties, b.properties)
                 if (propsPatch) {
-                    apply = appendPatch(apply,
-                        new VPatch(VPatch.PROPS, a, propsPatch))
+                    var newPatch = new VPatch(VPatch.PROPS, a, propsPatch);
+                    logEntries.push(`[PROPS]${JSON.stringify(propsPatch)}[/PROPS]`);
+                    apply = appendPatch(apply, newPatch);
                 }
-                apply = diffChildren(a, b, patch, apply, index)
+                apply = diffChildren(a, b, patch, apply, index, logEntries)
             } else {
-                apply = appendPatch(apply, new VPatch(VPatch.VNODE, a, b))
+                var newPatch = new VPatch(VPatch.VNODE, a, b);
+                logEntries.push(`[VNODE][DEL]${extractNodeContent(a)}[/DEL][/VNODE] [VNODE][INS]${extractNodeContent(b)}[/INS][/VNODE]`);
+                apply = appendPatch(apply, newPatch);
                 applyClear = true
             }
+        } else if (isVText(a)) {
+            var newPatch = new VPatch(VPatch.VTEXT, a, b);
+            logEntries.push(`[VTEXT][DEL]${a.text}[/DEL][INS]${b.text}[/INS][VTEXT]`);
+            apply = appendPatch(apply, newPatch);
+            applyClear = true
         } else {
-            apply = appendPatch(apply, new VPatch(VPatch.VNODE, a, b))
+            var newPatch = new VPatch(VPatch.VNODE, a, b);
+            logEntries.push(`[VNODE][DEL]${extractNodeContent(a)}[/DEL][/VNODE] [VNODE][INS]${extractNodeContent(b)}[/INS][/VNODE]`);
+            apply = appendPatch(apply, newPatch);
             applyClear = true
         }
     } else if (isVText(b)) {
         if (!isVText(a)) {
-            apply = appendPatch(apply, new VPatch(VPatch.VTEXT, a, b))
+            var newPatch = new VPatch(VPatch.VTEXT, a, b);
+            logEntries.push(`[VTEXT][DEL]${a.text}[/DEL][INS]${b.text}[/INS][VTEXT]`);
+            apply = appendPatch(apply, newPatch);
             applyClear = true
         } else if (a.text !== b.text) {
-            apply = appendPatch(apply, new VPatch(VPatch.VTEXT, a, b))
+            var newPatch = new VPatch(VPatch.VTEXT, a, b);
+            logEntries.push(`[VTEXT][DEL]${a.text}[/DEL][INS]${b.text}[/INS][VTEXT]`);
+            apply = appendPatch(apply, newPatch);
         }
     } else if (isWidget(b)) {
         if (!isWidget(a)) {
             applyClear = true
         }
-
-        apply = appendPatch(apply, new VPatch(VPatch.WIDGET, a, b))
+        var newPatch = new VPatch(VPatch.WIDGET, a, b);
+        logEntries.push(`[WIDGET] Old ID: ${a.id}, New ID: ${b.id}`);
+        apply = appendPatch(apply, newPatch);
     }
 
     if (apply) {
@@ -81,7 +155,23 @@ function walk(a, b, patch, index) {
     }
 }
 
-function diffChildren(a, b, patch, apply, index) {
+function extractNodeContent(node) {
+    var content = '';
+    if (isVNode(node)) {
+        if (node.children) {
+            content = node.children.map(extractNodeContent).join('');
+        }
+        var attributes = Object.entries(node.properties.attributes || {}).map(([key, value]) => `${key}="${value}"`).join(' ').trim();
+        var properties = Object.entries(node.properties).filter(([key]) => key !== 'attributes').map(([key, value]) => `${key}="${value}"`).join(' ').trim();
+        return `<${node.tagName}${attributes ? ' ' + attributes : ''}${properties ? ' ' + properties : ''}>${content}</${node.tagName}>`;
+    } else if (isVText(node)) {
+        content = node.text;
+    }
+    return content;
+}
+
+
+function diffChildren(a, b, patch, apply, index, logEntries) {
     var aChildren = a.children
     var orderedSet = reorder(aChildren, b.children)
     var bChildren = orderedSet.children
@@ -97,12 +187,12 @@ function diffChildren(a, b, patch, apply, index) {
 
         if (!leftNode) {
             if (rightNode) {
-                // Excess nodes in b need to be added
-                apply = appendPatch(apply,
-                    new VPatch(VPatch.INSERT, null, rightNode))
+                var newPatch = new VPatch(VPatch.INSERT, null, rightNode);
+                logEntries.push(`[INSERT][INS]${extractNodeContent(rightNode)}[/INS][/INSERT]`);
+                apply = appendPatch(apply, newPatch);
             }
         } else {
-            walk(leftNode, rightNode, patch, index)
+            walk(leftNode, rightNode, patch, index, logEntries)
         }
 
         if (isVNode(leftNode) && leftNode.count) {
@@ -111,12 +201,9 @@ function diffChildren(a, b, patch, apply, index) {
     }
 
     if (orderedSet.moves) {
-        // Reorder nodes last
-        apply = appendPatch(apply, new VPatch(
-            VPatch.ORDER,
-            a,
-            orderedSet.moves
-        ))
+        var newPatch = new VPatch(VPatch.ORDER, a, orderedSet.moves);
+        logEntries.push(`[ORDER]${JSON.stringify(orderedSet.moves)}[/ORDER]`);
+        apply = appendPatch(apply, newPatch);
     }
 
     return apply
@@ -253,7 +340,7 @@ function reorder(aChildren, bChildren) {
 
     // Iterate through a and match a node in b
     // O(N) time,
-    for (var i = 0 ; i < aChildren.length; i++) {
+    for (var i = 0; i < aChildren.length; i++) {
         var aItem = aChildren[i]
         var itemIndex
 
@@ -337,12 +424,10 @@ function reorder(aChildren, bChildren) {
                         else {
                             simulateIndex++
                         }
-                    }
-                    else {
+                    } else {
                         inserts.push({key: wantedItem.key, to: k})
                     }
-                }
-                else {
+                } else {
                     inserts.push({key: wantedItem.key, to: k})
                 }
                 k++
@@ -351,15 +436,14 @@ function reorder(aChildren, bChildren) {
             else if (simulateItem && simulateItem.key) {
                 removes.push(remove(simulate, simulateIndex, simulateItem.key))
             }
-        }
-        else {
+        } else {
             simulateIndex++
             k++
         }
     }
 
     // remove all the remaining nodes from simulate
-    while(simulateIndex < simulate.length) {
+    while (simulateIndex < simulate.length) {
         simulateItem = simulate[simulateIndex]
         removes.push(remove(simulate, simulateIndex, simulateItem && simulateItem.key))
     }
@@ -412,7 +496,33 @@ function keyIndex(children) {
     }
 }
 
+function formatPatch(patch) {
+    var type = patch.type
+    var vNode = patch.vNode
+    var patchData = patch.patch
+
+    switch (type) {
+        case VPatch.VTEXT:
+            return `<${vNode.tagName}>[DEL]${vNode.text}[/DEL][INS]${patchData.text}[/INS]</${vNode.tagName}>`
+        case VPatch.VNODE:
+            return `<${vNode.tagName}>[REPLACE]${vNode.children.map(formatPatch)}[/REPLACE]</${vNode.tagName}>`
+        case VPatch.WIDGET:
+            return `<${vNode.type}>[WIDGET]${vNode.id}[/WIDGET]</${vNode.type}>`
+        case VPatch.PROPS:
+            return `<${vNode.tagName}>[PROPS]${JSON.stringify(patchData)}[/PROPS]</${vNode.tagName}>`
+        case VPatch.ORDER:
+            return `<${vNode.tagName}>[ORDER]${JSON.stringify(patchData)}[/ORDER]</${vNode.tagName}>`
+        case VPatch.INSERT:
+            return `<${patchData.tagName}>[INS]${patchData.children.map(formatPatch)}[/INS]</${patchData.tagName}>`
+        case VPatch.REMOVE:
+            return `<${vNode.tagName}>[DEL]${vNode.children.map(formatPatch)}[/DEL]</${vNode.tagName}>`
+        default:
+            return ''
+    }
+}
+
 function appendPatch(apply, patch) {
+    // console.log("Format patch:", formatPatch(patch))
     if (apply) {
         if (isArray(apply)) {
             apply.push(patch)
